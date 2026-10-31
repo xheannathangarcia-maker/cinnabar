@@ -1,0 +1,12 @@
+[package]
+name = "fire-sword-mod"
+version = "0.1.0"
+edition = "2021"
+description = "Visual-only fire sword: animals you hit with a golden sword appear to burn."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mod-api = { path = "../../../crates/mod-api" }
