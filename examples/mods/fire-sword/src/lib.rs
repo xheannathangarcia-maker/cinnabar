@@ -1,146 +1,120 @@
-// GRANTS: player_state, hud
-// NOTE: Client-side HUD only. This is an OptiFine-style overlay that shows FPS (current, average, min, max),
-// player coordinates, facing direction, nearby entity count, and a zoom-style indicator label.
-// It cannot change real render settings, add real zoom, or alter the game. It only reads state and
-// displays it in the HUD label.
-
+// GRANTS: player_state, entities, render, hud
+// NOTE: Client-side visual only. No real item or real damage is added. The "pistol" is any held
+// golden_hoe (stand-in item). Bullets are visual tracers fired in the direction of the closest
+// actor in front of you (or straight ahead if none), since the API gives no click or look input.
+// A shot fires automatically every ~0.4s while holding the pistol and a mob/player is in range.
+// A muzzle flash and a hit spark are drawn. Nothing is actually damaged.
 use mod_api::bindings::{cinnabar::extension::{gameplay::Vector3, hud, player_state, render::{self, Billboard, BillboardPattern, Primitives, Rgba}}, Guest};
 use std::cell::RefCell;
 
-struct State {
-    time: f32,
-    frames: u32,
-    fps_sum: f32,
-    fps_min: f32,
-    fps_max: f32,
-    fps_now: f32,
-    last_update: f32,
-    last_pos: Option<(f32, f32, f32)>,
-    speed: f32,
-}
+struct Bullet { pos: (f32, f32, f32), dir: (f32, f32, f32), life: f32 }
+struct Flash { pos: (f32, f32, f32), life: f32 }
 
-impl Default for State {
-    fn default() -> Self {
-        State {
-            time: 0.0,
-            frames: 0,
-            fps_sum: 0.0,
-            fps_min: f32::MAX,
-            fps_max: 0.0,
-            fps_now: 0.0,
-            last_update: 0.0,
-            last_pos: None,
-            speed: 0.0,
-        }
-    }
+struct State {
+    bullets: Vec<Bullet>,
+    flashes: Vec<Flash>,
+    cooldown: f32,
+    clock: f32,
 }
 
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State::default());
+    static S: RefCell<State> = RefCell::new(State { bullets: vec![], flashes: vec![], cooldown: 0.0, clock: 0.0 });
 }
 
-fn compass(yaw: f32) -> &'static str {
-    let mut y = yaw % 360.0;
-    if y < 0.0 { y += 360.0; }
-    // Bedrock yaw: 0 = south, 90 = west, 180 = north, 270 = east
-    match ((y + 22.5) / 45.0) as u32 % 8 {
-        0 => "S",
-        1 => "SW",
-        2 => "W",
-        3 => "NW",
-        4 => "N",
-        5 => "NE",
-        6 => "E",
-        _ => "SE",
+fn holding_pistol() -> bool {
+    let Ok(Some(eq)) = player_state::read_equipment() else { return false };
+    let Some(slot) = eq.selected_slot else { return false };
+    eq.inventory
+        .get(slot as usize)
+        .and_then(|s| s.item.as_ref())
+        .and_then(|i| i.identifier.as_deref())
+        == Some("minecraft:golden_hoe")
+}
+
+fn bb(p: (f32, f32, f32), w: f32, h: f32, c: (f32, f32, f32, f32), pat: BillboardPattern) -> Billboard {
+    Billboard {
+        position: Vector3 { x: p.0, y: p.1, z: p.2 },
+        width: w,
+        height: h,
+        color: Rgba { r: c.0, g: c.1, b: c.2, a: c.3 },
+        pattern: pat,
+        upright: false,
     }
-}
-
-fn bar(fps: f32) -> &'static str {
-    if fps >= 120.0 { "||||||||||" }
-    else if fps >= 90.0 { "||||||||| " }
-    else if fps >= 60.0 { "||||||||  " }
-    else if fps >= 40.0 { "|||||     " }
-    else if fps >= 20.0 { "|||       " }
-    else { "|         " }
 }
 
 struct M;
 impl Guest for M {
     fn init() {
-        let _ = hud::set_label("OptiFine HUD loading...");
+        let _ = hud::set_label("Pistol: hold a golden hoe");
     }
-
     fn frame() {
-        let fps = player_state::read_fps().ok().flatten().unwrap_or(0.0);
-        let dt = if fps > 1.0 { 1.0 / fps } else { 0.0 };
+        let fps = player_state::read_fps().ok().flatten().unwrap_or(60.0).max(1.0);
+        let dt = 1.0 / fps;
+        let armed = holding_pistol();
+        let me = player_state::read_world().ok().flatten();
 
-        let world = player_state::read_world().ok().flatten();
-        let actors = player_state::read_actors().unwrap_or_default();
-
-        ST.with(|s| {
+        S.with(|s| {
             let mut s = s.borrow_mut();
-            s.time += dt;
-            s.fps_now = fps;
-            if fps > 0.0 {
-                s.frames += 1;
-                s.fps_sum += fps;
-                if fps < s.fps_min { s.fps_min = fps; }
-                if fps > s.fps_max { s.fps_max = fps; }
-            }
+            s.clock += dt;
+            s.cooldown = (s.cooldown - dt).max(0.0);
 
-            // Update the label about 5 times per second to keep work small and text readable
-            if s.time - s.last_update < 0.2 {
-                return;
-            }
-            let elapsed = s.time - s.last_update;
-            s.last_update = s.time;
-
-            let mut pos_text = String::from("XYZ: n/a");
-            let mut dir_text = String::from("Facing: n/a");
-            if let Some(w) = world {
-                let p = w.position;
-                pos_text = format!("XYZ: {:.1} / {:.1} / {:.1}", p.0, p.1, p.2);
-
-                if let Some(prev) = s.last_pos {
-                    let dx = p.0 - prev.0;
-                    let dz = p.2 - prev.2;
-                    if elapsed > 0.0 {
-                        s.speed = (dx * dx + dz * dz).sqrt() / elapsed;
+            if armed {
+                if let Some(w) = &me {
+                    if w.alive && s.cooldown <= 0.0 {
+                        let origin = (w.position.0, w.position.1 + 0.2, w.position.2);
+                        let actors = player_state::read_actors().ok().unwrap_or_default();
+                        let mut best: Option<((f32, f32, f32), f32)> = None;
+                        for a in actors.iter() {
+                            if a.runtime_id == w.runtime_id { continue; }
+                            let tx = a.position.0 - origin.0;
+                            let ty = a.position.1 + 0.9 - origin.1;
+                            let tz = a.position.2 - origin.2;
+                            let d = (tx * tx + ty * ty + tz * tz).sqrt();
+                            if d < 0.5 || d > 30.0 { continue; }
+                            if best.map_or(true, |b| d < b.1) {
+                                best = Some(((tx / d, ty / d, tz / d), d));
+                            }
+                        }
+                        if let Some((dir, _)) = best {
+                            s.bullets.push(Bullet { pos: origin, dir, life: 1.0 });
+                            s.flashes.push(Flash { pos: (origin.0 + dir.0 * 0.6, origin.1 + dir.1 * 0.6, origin.2 + dir.2 * 0.6), life: 0.08 });
+                            s.cooldown = 0.4;
+                        }
                     }
                 }
-                s.last_pos = Some(p);
+            }
 
-                // Use own yaw from the actor list if our runtime id appears there
-                if let Some(me) = actors.iter().find(|a| a.runtime_id == w.runtime_id) {
-                    dir_text = format!("Facing: {} ({:.0})", compass(me.yaw), me.yaw);
+            let speed = 40.0;
+            for b in s.bullets.iter_mut() {
+                b.pos.0 += b.dir.0 * speed * dt;
+                b.pos.1 += b.dir.1 * speed * dt;
+                b.pos.2 += b.dir.2 * speed * dt;
+                b.life -= dt;
+            }
+            for f in s.flashes.iter_mut() { f.life -= dt; }
+            s.bullets.retain(|b| b.life > 0.0);
+            s.flashes.retain(|f| f.life > 0.0);
+
+            let mut billboards: Vec<Billboard> = Vec::new();
+            for b in s.bullets.iter() {
+                billboards.push(bb(b.pos, 0.12, 0.12, (1.0, 0.9, 0.4, 1.0), BillboardPattern::SoftDisc));
+                for i in 1..4 {
+                    let t = i as f32 * 0.35;
+                    let p = (b.pos.0 - b.dir.0 * t, b.pos.1 - b.dir.1 * t, b.pos.2 - b.dir.2 * t);
+                    let a = 0.6 - i as f32 * 0.15;
+                    billboards.push(bb(p, 0.08, 0.08, (1.0, 0.7, 0.2, a), BillboardPattern::Spark));
                 }
             }
-
-            let avg = if s.frames > 0 { s.fps_sum / s.frames as f32 } else { 0.0 };
-            let min = if s.fps_min == f32::MAX { 0.0 } else { s.fps_min };
-
-            let mobs = actors.iter().filter(|a| !a.player).count();
-            let players = actors.iter().filter(|a| a.player).count();
-
-            let text = format!(
-                "[OptiFine] {:.0} fps [{}]\nAvg {:.0}  Min {:.0}  Max {:.0}\n{}\n{}\nSpeed: {:.1} b/s\nEntities: {} mobs, {} players",
-                s.fps_now, bar(s.fps_now), avg, min, s.fps_max, pos_text, dir_text, s.speed, mobs, players
-            );
-            let _ = hud::set_label(&text);
-
-            // Reset min/max window every ~10 seconds so stats stay relevant
-            if s.time > 10.0 && s.frames > 600 {
-                s.frames = 0;
-                s.fps_sum = 0.0;
-                s.fps_min = f32::MAX;
-                s.fps_max = 0.0;
-                s.time = 0.0;
-                s.last_update = 0.0;
+            for f in s.flashes.iter() {
+                let flick = 0.25 + 0.05 * (s.clock * 80.0).sin();
+                billboards.push(bb(f.pos, flick, flick, (1.0, 0.85, 0.3, 0.9), BillboardPattern::Spark));
+                billboards.push(bb(f.pos, flick * 1.6, flick * 1.6, (1.0, 0.5, 0.1, 0.5), BillboardPattern::SoftDisc));
             }
+
+            let _ = render::draw(&Primitives { decals: vec![], ribbons: vec![], beams: vec![], billboards });
         });
 
-        // Draw nothing extra; clear any previous drawing
-        let _ = render::draw(&Primitives { decals: vec![], ribbons: vec![], beams: vec![], billboards: Vec::<Billboard>::new() });
+        let _ = hud::set_label(if armed { "Pistol: ARMED" } else { "Pistol: hold a golden hoe" });
     }
 }
 mod_api::bindings::export!(M with_types_in mod_api::bindings);
