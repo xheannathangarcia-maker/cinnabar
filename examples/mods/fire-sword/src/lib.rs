@@ -111,4 +111,81 @@ fn step(s: &mut State) {
     s.now += 1.0 / fps as f64;
 
     let mobs: Vec<Mob> = gameplay::read_mobs().unwrap_or_default();
-    let events = player_state
+        let events = player_state::read_combat(s.last_seq, 4).unwrap_or_default();
+    let warm = s.now < WARMUP_SECONDS;
+    let holding = !events.is_empty() && holding_fire_sword();
+
+    for ev in events {
+        s.last_seq = s.last_seq.max(ev.sequence);
+        if warm || !holding || !ev.local || !matches!(ev.kind, CombatKind::AttackAdmitted) {
+            continue;
+        }
+        // Prefer the mob the event names; otherwise the nearest mob to where it happened.
+        let target = mobs
+            .iter()
+            .find(|m| m.runtime_id == ev.runtime_id)
+            .or_else(|| {
+                mobs.iter()
+                    .map(|m| (dist2((m.position.x, m.position.y, m.position.z), ev.position), m))
+                    .filter(|(d, _)| *d <= FALLBACK_RANGE_BLOCKS * FALLBACK_RANGE_BLOCKS)
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, m)| m)
+            });
+        let Some(mob) = target else { continue };
+        if !is_animal(&mob.type_id) {
+            continue;
+        }
+        let until = s.now + BURN_SECONDS;
+        let id = mob.runtime_id;
+        if let Some(i) = s.burning.iter().position(|b| b.id == id) {
+            s.burning[i].until = until;
+        } else if s.burning.len() < MAX_BURNING {
+            s.burning.push(Burn { id, until });
+        }
+    }
+
+    let now = s.now;
+    s.burning.retain(|b| b.until > now);
+    if s.burning.is_empty() {
+        return;
+    }
+
+    let mut billboards = Vec::new();
+    for burn in &s.burning {
+        let Some(mob) = mobs.iter().find(|m| m.runtime_id == burn.id) else {
+            continue; // out of range this frame; keep the timer running
+        };
+        let fade = ((burn.until - now) / 0.6).clamp(0.0, 1.0) as f32;
+        let height = body_height(&mob.type_id);
+        for k in 0..6u32 {
+            let t = k as f32 / 5.0; // 0 at the feet, 1 at the top
+            let phase = (now as f32) * 9.0 + (burn.id % 97) as f32 * 1.7 + k as f32 * 1.3;
+            let mut pos = mob.position;
+            pos.x += phase.sin() * 0.22 * height;
+            pos.z += (phase * 1.1).cos() * 0.22 * height;
+            pos.y += 0.1 + t * height + (phase * 1.3).sin() * 0.05;
+            let size = (0.75 - 0.35 * t) * (0.6 + 0.4 * height.min(1.2));
+            // Orange at the base fading to yellow at the tips.
+            let color = Rgba { r: 1.0, g: 0.3 + 0.5 * t, b: 0.05 + 0.1 * t, a: (0.9 - 0.3 * t) * fade };
+            billboards.push(Billboard {
+                position: pos,
+                width: size,
+                height: size * 1.25,
+                color,
+                pattern: if k % 2 == 0 { BillboardPattern::SoftDisc } else { BillboardPattern::Spark },
+                upright: false,
+            });
+        }
+    }
+
+    if !billboards.is_empty() {
+        let _ = render::draw(&Primitives {
+            decals: Vec::new(),
+            ribbons: Vec::new(),
+            beams: Vec::new(),
+            billboards,
+        });
+    }
+}
+
+mod_api::bindings::export!(FireSword with_types_in mod_api::bindings);
