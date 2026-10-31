@@ -1,8 +1,8 @@
 [package]
-name = "fire-sword-mod"
+name = "optifine"
 version = "0.1.0"
 edition = "2021"
-description = "Visual-only fire sword: animals you hit with a golden sword appear to burn."
+description = "Visual-only fps."
 license = "MIT"
 
 [lib]
