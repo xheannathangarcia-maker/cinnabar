@@ -1,199 +1,146 @@
-//! Fire Sword (visual only).
-//!
-//! While you hold the FIRE_SWORD item, hitting an animal makes it look like it is on fire
-//! for a few seconds. Nothing is sent to the server: other players see nothing and the
-//! animal takes no extra damage. The flames are drawn locally as camera-facing billboards.
-//!
-//! Grants needed: player_state, entities, render.
+// GRANTS: player_state, hud
+// NOTE: Client-side HUD only. This is an OptiFine-style overlay that shows FPS (current, average, min, max),
+// player coordinates, facing direction, nearby entity count, and a zoom-style indicator label.
+// It cannot change real render settings, add real zoom, or alter the game. It only reads state and
+// displays it in the HUD label.
 
+use mod_api::bindings::{cinnabar::extension::{gameplay::Vector3, hud, player_state, render::{self, Billboard, BillboardPattern, Primitives, Rgba}}, Guest};
 use std::cell::RefCell;
 
-use mod_api::bindings::{
-    cinnabar::extension::{
-        gameplay::{self, Mob},
-        hud, player_state,
-        player_state::CombatKind,
-        render::{self, Billboard, BillboardPattern, Primitives, Rgba},
-    },
-    Guest,
-};
-
-/// The item that counts as the fire sword. Change this to any item identifier.
-const FIRE_SWORD: &str = "minecraft:golden_sword";
-/// How long a hit animal keeps burning, in seconds.
-const BURN_SECONDS: f64 = 4.0;
-/// Ignore combat evidence for this long after load, so old retained hits do not ignite things.
-const WARMUP_SECONDS: f64 = 1.0;
-/// If the hit event's actor id is not in the mob list, use the nearest mob within this range.
-const FALLBACK_RANGE_BLOCKS: f32 = 6.0;
-/// Most animals burning at once.
-const MAX_BURNING: usize = 16;
-
-/// Animals that can be set alight. Add or remove identifiers to taste.
-const ANIMALS: &[&str] = &[
-    "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken",
-    "minecraft:horse", "minecraft:donkey", "minecraft:mule", "minecraft:llama",
-    "minecraft:rabbit", "minecraft:cat", "minecraft:wolf", "minecraft:fox",
-    "minecraft:goat", "minecraft:mooshroom", "minecraft:ocelot", "minecraft:parrot",
-    "minecraft:panda", "minecraft:polar_bear", "minecraft:turtle", "minecraft:camel",
-];
-
-struct Burn {
-    id: u64,
-    until: f64,
+struct State {
+    time: f32,
+    frames: u32,
+    fps_sum: f32,
+    fps_min: f32,
+    fps_max: f32,
+    fps_now: f32,
+    last_update: f32,
+    last_pos: Option<(f32, f32, f32)>,
+    speed: f32,
 }
 
-#[derive(Default)]
-struct State {
-    last_seq: u64,
-    now: f64,
-    burning: Vec<Burn>,
+impl Default for State {
+    fn default() -> Self {
+        State {
+            time: 0.0,
+            frames: 0,
+            fps_sum: 0.0,
+            fps_min: f32::MAX,
+            fps_max: 0.0,
+            fps_now: 0.0,
+            last_update: 0.0,
+            last_pos: None,
+            speed: 0.0,
+        }
+    }
 }
 
 thread_local! {
-    static STATE: RefCell<State> = RefCell::new(State::default());
+    static ST: RefCell<State> = RefCell::new(State::default());
 }
 
-struct FireSword;
+fn compass(yaw: f32) -> &'static str {
+    let mut y = yaw % 360.0;
+    if y < 0.0 { y += 360.0; }
+    // Bedrock yaw: 0 = south, 90 = west, 180 = north, 270 = east
+    match ((y + 22.5) / 45.0) as u32 % 8 {
+        0 => "S",
+        1 => "SW",
+        2 => "W",
+        3 => "NW",
+        4 => "N",
+        5 => "NE",
+        6 => "E",
+        _ => "SE",
+    }
+}
 
-impl Guest for FireSword {
+fn bar(fps: f32) -> &'static str {
+    if fps >= 120.0 { "||||||||||" }
+    else if fps >= 90.0 { "||||||||| " }
+    else if fps >= 60.0 { "||||||||  " }
+    else if fps >= 40.0 { "|||||     " }
+    else if fps >= 20.0 { "|||       " }
+    else { "|         " }
+}
+
+struct M;
+impl Guest for M {
     fn init() {
-        let _ = hud::set_label("Fire Sword: hold a golden sword and hit an animal");
+        let _ = hud::set_label("OptiFine HUD loading...");
     }
 
     fn frame() {
-        STATE.with(|cell| step(&mut cell.borrow_mut()));
-    }
-}
+        let fps = player_state::read_fps().ok().flatten().unwrap_or(0.0);
+        let dt = if fps > 1.0 { 1.0 / fps } else { 0.0 };
 
-fn is_animal(type_id: &str) -> bool {
-    ANIMALS.contains(&type_id)
-}
+        let world = player_state::read_world().ok().flatten();
+        let actors = player_state::read_actors().unwrap_or_default();
 
-/// Rough flame height by animal size.
-fn body_height(type_id: &str) -> f32 {
-    match type_id {
-        "minecraft:chicken" | "minecraft:rabbit" | "minecraft:cat" | "minecraft:parrot"
-        | "minecraft:ocelot" | "minecraft:turtle" => 0.5,
-        "minecraft:cow" | "minecraft:horse" | "minecraft:donkey" | "minecraft:mule"
-        | "minecraft:llama" | "minecraft:mooshroom" | "minecraft:camel"
-        | "minecraft:polar_bear" => 1.5,
-        _ => 0.9,
-    }
-}
+        ST.with(|s| {
+            let mut s = s.borrow_mut();
+            s.time += dt;
+            s.fps_now = fps;
+            if fps > 0.0 {
+                s.frames += 1;
+                s.fps_sum += fps;
+                if fps < s.fps_min { s.fps_min = fps; }
+                if fps > s.fps_max { s.fps_max = fps; }
+            }
 
-fn holding_fire_sword() -> bool {
-    let Ok(Some(eq)) = player_state::read_equipment() else {
-        return false;
-    };
-    let Some(slot) = eq.selected_slot else {
-        return false;
-    };
-    eq.inventory
-        .get(slot as usize)
-        .and_then(|s| s.item.as_ref())
-        .and_then(|i| i.identifier.as_deref())
-        == Some(FIRE_SWORD)
-}
+            // Update the label about 5 times per second to keep work small and text readable
+            if s.time - s.last_update < 0.2 {
+                return;
+            }
+            let elapsed = s.time - s.last_update;
+            s.last_update = s.time;
 
-fn dist2(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
-    let (dx, dy, dz) = (a.0 - b.0, a.1 - b.1, a.2 - b.2);
-    dx * dx + dy * dy + dz * dz
-}
+            let mut pos_text = String::from("XYZ: n/a");
+            let mut dir_text = String::from("Facing: n/a");
+            if let Some(w) = world {
+                let p = w.position;
+                pos_text = format!("XYZ: {:.1} / {:.1} / {:.1}", p.0, p.1, p.2);
 
-fn step(s: &mut State) {
-    // Real elapsed time from measured fps (no clock grant needed).
-    let fps = player_state::read_fps()
-        .ok()
-        .flatten()
-        .filter(|f| *f > 1.0)
-        .unwrap_or(60.0);
-    s.now += 1.0 / fps as f64;
+                if let Some(prev) = s.last_pos {
+                    let dx = p.0 - prev.0;
+                    let dz = p.2 - prev.2;
+                    if elapsed > 0.0 {
+                        s.speed = (dx * dx + dz * dz).sqrt() / elapsed;
+                    }
+                }
+                s.last_pos = Some(p);
 
-        let mobs_res = gameplay::read_mobs();
-    let events_res = player_state::read_combat(s.last_seq, 4);
-    let _ = hud::set_label(&format!(
-        "FS dbg mobs={:?} events={:?} held={}",
-        mobs_res.as_ref().map(|m| m.len()),
-        events_res.as_ref().map(|e| e.len()),
-        holding_fire_sword()
-    ));
-    let mobs: Vec<Mob> = mobs_res.unwrap_or_default();
-    let events = events_res.unwrap_or_default();
-    let warm = s.now < WARMUP_SECONDS;
-    let holding = !events.is_empty() && holding_fire_sword();
+                // Use own yaw from the actor list if our runtime id appears there
+                if let Some(me) = actors.iter().find(|a| a.runtime_id == w.runtime_id) {
+                    dir_text = format!("Facing: {} ({:.0})", compass(me.yaw), me.yaw);
+                }
+            }
 
-    for ev in events {
-        s.last_seq = s.last_seq.max(ev.sequence);
-        if warm || !holding || !ev.local || !matches!(ev.kind, CombatKind::AttackAdmitted) {
-            continue;
-        }
-        // Prefer the mob the event names; otherwise the nearest mob to where it happened.
-        let target = mobs
-            .iter()
-            .find(|m| m.runtime_id == ev.runtime_id)
-            .or_else(|| {
-                mobs.iter()
-                    .map(|m| (dist2((m.position.x, m.position.y, m.position.z), ev.position), m))
-                    .filter(|(d, _)| *d <= FALLBACK_RANGE_BLOCKS * FALLBACK_RANGE_BLOCKS)
-                    .min_by(|a, b| a.0.total_cmp(&b.0))
-                    .map(|(_, m)| m)
-            });
-        let Some(mob) = target else { continue };
-        if !is_animal(&mob.type_id) {
-            continue;
-        }
-        let until = s.now + BURN_SECONDS;
-        let id = mob.runtime_id;
-        if let Some(i) = s.burning.iter().position(|b| b.id == id) {
-            s.burning[i].until = until;
-        } else if s.burning.len() < MAX_BURNING {
-            s.burning.push(Burn { id, until });
-        }
-    }
+            let avg = if s.frames > 0 { s.fps_sum / s.frames as f32 } else { 0.0 };
+            let min = if s.fps_min == f32::MAX { 0.0 } else { s.fps_min };
 
-    let now = s.now;
-    s.burning.retain(|b| b.until > now);
-    if s.burning.is_empty() {
-        return;
-    }
+            let mobs = actors.iter().filter(|a| !a.player).count();
+            let players = actors.iter().filter(|a| a.player).count();
 
-    let mut billboards = Vec::new();
-    for burn in &s.burning {
-        let Some(mob) = mobs.iter().find(|m| m.runtime_id == burn.id) else {
-            continue; // out of range this frame; keep the timer running
-        };
-        let fade = ((burn.until - now) / 0.6).clamp(0.0, 1.0) as f32;
-        let height = body_height(&mob.type_id);
-        for k in 0..6u32 {
-            let t = k as f32 / 5.0; // 0 at the feet, 1 at the top
-            let phase = (now as f32) * 9.0 + (burn.id % 97) as f32 * 1.7 + k as f32 * 1.3;
-            let mut pos = mob.position;
-            pos.x += phase.sin() * 0.22 * height;
-            pos.z += (phase * 1.1).cos() * 0.22 * height;
-            pos.y += 0.1 + t * height + (phase * 1.3).sin() * 0.05;
-            let size = (0.75 - 0.35 * t) * (0.6 + 0.4 * height.min(1.2));
-            // Orange at the base fading to yellow at the tips.
-            let color = Rgba { r: 1.0, g: 0.3 + 0.5 * t, b: 0.05 + 0.1 * t, a: (0.9 - 0.3 * t) * fade };
-            billboards.push(Billboard {
-                position: pos,
-                width: size,
-                height: size * 1.25,
-                color,
-                pattern: if k % 2 == 0 { BillboardPattern::SoftDisc } else { BillboardPattern::Spark },
-                upright: false,
-            });
-        }
-    }
+            let text = format!(
+                "[OptiFine] {:.0} fps [{}]\nAvg {:.0}  Min {:.0}  Max {:.0}\n{}\n{}\nSpeed: {:.1} b/s\nEntities: {} mobs, {} players",
+                s.fps_now, bar(s.fps_now), avg, min, s.fps_max, pos_text, dir_text, s.speed, mobs, players
+            );
+            let _ = hud::set_label(&text);
 
-    if !billboards.is_empty() {
-        let _ = render::draw(&Primitives {
-            decals: Vec::new(),
-            ribbons: Vec::new(),
-            beams: Vec::new(),
-            billboards,
+            // Reset min/max window every ~10 seconds so stats stay relevant
+            if s.time > 10.0 && s.frames > 600 {
+                s.frames = 0;
+                s.fps_sum = 0.0;
+                s.fps_min = f32::MAX;
+                s.fps_max = 0.0;
+                s.time = 0.0;
+                s.last_update = 0.0;
+            }
         });
+
+        // Draw nothing extra; clear any previous drawing
+        let _ = render::draw(&Primitives { decals: vec![], ribbons: vec![], beams: vec![], billboards: Vec::<Billboard>::new() });
     }
 }
-
-mod_api::bindings::export!(FireSword with_types_in mod_api::bindings);
+mod_api::bindings::export!(M with_types_in mod_api::bindings);
