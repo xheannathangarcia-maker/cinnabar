@@ -1,0 +1,39 @@
+name: Build Fire Sword mod
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and wasm target
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libudev-dev
+
+      - name: Register the mod in the workspace (if not already covered)
+        run: |
+          if ! grep -q 'examples/mods/fire-sword\|examples/mods/\*' Cargo.toml; then
+            sed -i '0,/members *= *\[/s//members = [\n  "examples\/mods\/fire-sword",/' Cargo.toml
+          fi
+          grep -n 'examples/mods' Cargo.toml || true
+
+      - name: Build the guest
+        run: cargo build -p fire-sword-mod --target wasm32-unknown-unknown --release
+
+      - name: Pack as a Cinnabar component
+        run: |
+          cargo run -p mod-host --bin mod-host -- pack \
+            target/wasm32-unknown-unknown/release/fire_sword_mod.wasm fire-sword.wasm
+
+      - name: Upload the .wasm
+        uses: actions/upload-artifact@v4
+        with:
+          name: fire-sword-wasm
+          path: fire-sword.wasm
