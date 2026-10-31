@@ -110,8 +110,16 @@ fn step(s: &mut State) {
         .unwrap_or(60.0);
     s.now += 1.0 / fps as f64;
 
-    let mobs: Vec<Mob> = gameplay::read_mobs().unwrap_or_default();
-        let events = player_state::read_combat(s.last_seq, 4).unwrap_or_default();
+        let mobs_res = gameplay::read_mobs();
+    let events_res = player_state::read_combat(s.last_seq, 4);
+    let _ = hud::set_label(&format!(
+        "FS dbg mobs={:?} events={:?} held={}",
+        mobs_res.as_ref().map(|m| m.len()),
+        events_res.as_ref().map(|e| e.len()),
+        holding_fire_sword()
+    ));
+    let mobs: Vec<Mob> = mobs_res.unwrap_or_default();
+    let events = events_res.unwrap_or_default();
     let warm = s.now < WARMUP_SECONDS;
     let holding = !events.is_empty() && holding_fire_sword();
 
